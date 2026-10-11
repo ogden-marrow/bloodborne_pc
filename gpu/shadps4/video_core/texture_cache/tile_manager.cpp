@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -316,8 +317,13 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         copy.bufferOffset += staging.offset;
     }
 
-    runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
-    runtime.FlushBarriers();
+    // BB_EXPERIMENT_SKIP_TILE_COPY=1 (measurement only, the picture is wrong): skips the image -> staging
+    // copy to show how much frame time that step costs.
+    static const bool skip_copy = std::getenv("BB_EXPERIMENT_SKIP_TILE_COPY") != nullptr;
+    if (!skip_copy) {
+        runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
+        runtime.FlushBarriers();
+    }
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),
