@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_toggles.h"
+#include <cstdio>
 #include <cstdlib>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -285,6 +287,13 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
                             const VideoCore::Buffer* out_buffer, u64 out_offset) {
     const auto& info = in_image.info;
+    // BB_TRACE_TILE=1: one line per re-tile: frame, guest address, size, format, tiled (stderr).
+    if (static const bool trace = std::getenv("BB_TRACE_TILE") != nullptr; trace) {
+        std::fprintf(stderr, "TILE frame %u addr %#llx size %#llx fmt %d %ux%u tiled %d\n",
+                     BbStats::frame_number.load(std::memory_order_relaxed),
+                     (unsigned long long)info.guest_address, (unsigned long long)info.guest_size,
+                     int(info.pixel_format), info.size.width, info.size.height, int(info.props.is_tiled));
+    }
     if (!info.props.is_tiled) {
         for (auto& copy : buffer_copies) {
             copy.bufferOffset += out_offset;
