@@ -1100,7 +1100,14 @@ void TextureCache::GarbageCollectImages() {
             const char* env = std::getenv("BB_GC_BUDGET_MB");
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
-        if (instance.IsIntegrated() || forced_budget) {
+        // bbport: on a discrete 4 GB GPU too: the budget the driver reports now (it falls when
+        // the desktop or another program takes VRAM), not the one taken at start.
+        // BB_GC_LIVE_BUDGET=0 keeps the start-time marks.
+        static const bool live_budget = [] {
+            const char* env = std::getenv("BB_GC_LIVE_BUDGET");
+            return !env || env[0] != '0';
+        }();
+        if (instance.IsIntegrated() || forced_budget || live_budget) {
             const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
             if (budget != 0) {
                 trigger_gc_memory = budget / 10 * 7;

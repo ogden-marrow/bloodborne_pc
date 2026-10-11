@@ -161,8 +161,15 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
-    for (Ring& ring : rings) {
-        TrimRing(ring);
+    // bbport: the device-local ring is VRAM: 41 idle 16 MiB blocks (650 MB) were seen on a 4 GB
+    // GPU. It keeps 64 MiB, and frees blocks idle for 5 s (1 s with VRAM nearly full).
+    bool tight = false;
+    if (instance.CanReportMemoryUsage() && !instance.IsIntegrated() && (frame & 15) == 0) {
+        tight = instance.GetDeviceMemoryUsage() + (640ull << 20) > instance.GetDeviceMemoryBudgetNow();
+        vram_tight = tight;
+    }
+    for (size_t i = 0; i < rings.size(); ++i) {
+        TrimRing(rings[i], i == u32(MemoryType::DeviceLocal), vram_tight);
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -170,11 +177,13 @@ void StagingBufferPool::TickFrame() {
     PublishStats();
 }
 
-void StagingBufferPool::TrimRing(Ring& ring) {
+void StagingBufferPool::TrimRing(Ring& ring, bool device_local, bool tight) {
     auto& blocks = ring.blocks;
+    const u64 keep = device_local ? 64_MB / BLOCK_SIZE : keep_blocks;
+    const u64 idle_frames = device_local ? (tight ? 60 : 300) : RING_IDLE_FRAMES;
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
-        if (blocks.size() <= keep_blocks || frame - block.last_used_frame < RING_IDLE_FRAMES ||
+        if (blocks.size() <= keep || frame - block.last_used_frame < idle_frames ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }

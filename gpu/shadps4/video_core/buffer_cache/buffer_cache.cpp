@@ -520,6 +520,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
+    // bbport: system memory the arenas can also be bound to, for when VRAM is full (4 GB GPUs):
+    // slower (PCIe) but the game goes on. UINT32_MAX: none.
+    arena_host_memory_type_index =
+        FindMemoryType(instance.GetMemoryProperties(),
+                       vk::MemoryPropertyFlagBits::eHostVisible |
+                           vk::MemoryPropertyFlagBits::eHostCoherent,
+                       reqs.memoryTypeBits)
+            .value_or(UINT32_MAX);
+    LOG_WARNING(Render_Vulkan, "Arena memory types: device-local {}, host fallback {} (sparse bits {:#x})",
+             arena_memory_type_index, arena_host_memory_type_index, reqs.memoryTypeBits);
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -1214,9 +1224,18 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // lives in; the rest (and everything without it) gets VRAM as before.
     std::vector<ResidentBind> binds;
     if (GuestInPlace()) {
+        // BB_TIGHT_IN_PLACE=1: with VRAM nearly full new blocks are read in place; off by default
+        // (hot geometry read over PCIe every frame is far slower than evicting cold blocks).
+        static const bool tight_in_place = [] {
+            const char* env = std::getenv("BB_TIGHT_IN_PLACE");
+            return env && env[0] == '1';
+        }();
+        const bool tight = tight_in_place && VramTight();
         IntervalList rest;
         for (const auto& range : bind_ranges) {
-            BindInPlace(range.start, range.end, binds, rest, in_place);
+            // bbport: with VRAM nearly full a block is read in place (system memory over PCIe)
+            // instead of getting a VRAM copy: the copy is only an optimization (4 GB GPUs).
+            BindInPlace(range.start, range.end, binds, rest, in_place || tight);
         }
         bind_ranges = std::move(rest);
     }
@@ -1292,6 +1311,38 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+// bbport: less than 640 MiB of the driver's budget left (a 4 GB GPU with the desktop and the
+// upscaler in it). Optional VRAM growth (the spare block, promotion to VRAM copies) waits.
+// BB_VRAM_HEADROOM_MB=N changes the 640.
+bool BufferCache::VramTight() {
+    if (!instance.CanReportMemoryUsage() || instance.IsIntegrated()) {
+        return false;
+    }
+    static const u64 headroom = [] {
+        const char* env = std::getenv("BB_VRAM_HEADROOM_MB");
+        return (env ? std::strtoull(env, nullptr, 10) : 640ull) << 20;
+    }();
+    // The driver's budget now (it shrinks when the desktop or another app takes VRAM), not the
+    // one taken at start.
+    const u64 budget = instance.GetDeviceMemoryBudgetNow();
+    const u64 used = instance.GetDeviceMemoryUsage();
+    static std::atomic<bool> reported{false};
+    if (used + headroom > budget && !reported.exchange(true)) {
+        if (const char* dump = std::getenv("BB_VMA_DUMP")) {
+            char* json = nullptr;
+            vmaBuildStatsString(instance.GetAllocator(), &json, VK_TRUE);
+            if (FILE* f = std::fopen(dump, "w")) {
+                std::fputs(json, f);
+                std::fclose(f);
+            }
+            vmaFreeStatsString(instance.GetAllocator(), json);
+        }
+        LOG_WARNING(Render_Vulkan, "VRAM is tight: using {} MiB of a {} MiB budget; new guest blocks "
+                    "are read in place from system memory", used >> 20, budget >> 20);
+    }
+    return used + headroom > budget;
+}
+
 std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
     if (bytes == block_size && free_slot_count != 0) {
         // bbport: a slot of the fullest chunk: the emptier ones drain and go back to the driver.
@@ -1326,10 +1377,47 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
         BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
         return memory;
     };
+    // bbport: the spare block is only an optimization (allocated ahead, in the background). On a
+    // GPU with little VRAM (4 GB) a failed spare must not stop the game: it returns a null handle
+    // and the block is allocated when it is needed (or, by then, there is room again).
+    const auto try_allocate = [this](u64 size, u32 type) -> vk::DeviceMemory {
+        vk::DeviceMemory memory{};
+        const vk::MemoryAllocateInfo info{.allocationSize = size, .memoryTypeIndex = type};
+        const auto result = instance.GetDevice().allocateMemory(&info, nullptr, &memory);
+        if (result != vk::Result::eSuccess) {
+            return {};
+        }
+        BbStats::device_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+        BbStats::residency_alloc_bytes.fetch_add(size, std::memory_order_relaxed);
+        return memory;
+    };
+    const auto allocate_spare = [try_allocate, type = arena_memory_type_index](u64 size) {
+        return try_allocate(size, type);
+    };
     if (residency_used + bytes > residency_size) {
-        const u64 size = std::max(bytes, ResidencyBlock);
-        residency_memory = size == ResidencyBlock && spare_residency.valid() ? spare_residency.get()
-                                                                              : allocate(size);
+        u64 size = std::max(bytes, ResidencyBlock);
+        vk::DeviceMemory block{};
+        if (size == ResidencyBlock && spare_residency.valid()) {
+            block = spare_residency.get();
+        }
+        if (!block) {
+            block = try_allocate(size, arena_memory_type_index);
+        }
+        if (!block && size > bytes) {
+            // bbport: VRAM is nearly full: only what is asked for (in 4 MiB steps), not a 64 MiB block.
+            size = Common::AlignUp(bytes, 4_MB);
+            block = try_allocate(size, arena_memory_type_index);
+        }
+        if (!block && arena_host_memory_type_index != UINT32_MAX) {
+            // bbport: no VRAM left: system memory (the GPU reads it over PCIe) rather than a crash.
+            block = try_allocate(size, arena_host_memory_type_index);
+            static std::atomic<bool> reported{false};
+            if (block && !reported.exchange(true)) {
+                LOG_WARNING(Render_Vulkan,
+                            "VRAM is full: guest memory chunks now go to system memory (slower)");
+            }
+        }
+        residency_memory = block ? block : allocate(size);
         residency_size = size;
         residency_used = 0;
         residency_chunks[static_cast<VkDeviceMemory>(residency_memory)] = {size, 0, 0, 0};
@@ -1337,8 +1425,8 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
     const u64 offset = residency_used;
     residency_used += bytes;
     residency_chunks[static_cast<VkDeviceMemory>(residency_memory)].used += bytes;
-    if (!spare_residency.valid() && residency_used * 2 >= residency_size) {
-        spare_residency = std::async(std::launch::async, allocate, ResidencyBlock);
+    if (!spare_residency.valid() && residency_used * 2 >= residency_size && !VramTight()) {
+        spare_residency = std::async(std::launch::async, allocate_spare, ResidencyBlock);
     }
     NoteResidencyUnused();
     return {residency_memory, offset};
@@ -1427,6 +1515,11 @@ void BufferCache::ProcessIdleBlocks() {
         return;
     }
     idle_scan_second = now;
+    // bbport: with VRAM nearly full (4 GB GPUs) the blocks go back in place after 2 s unused rather
+    // than 60 s, and a chunk is emptied every second: a big area fills VRAM far faster than the
+    // timers allow, and the game then reads what it does not need now over PCIe, not from VRAM.
+    const bool tight = VramTight();
+    const u32 idle_limit = tight ? 2u : VramIdleSeconds();
     // Blocks in VRAM whose 2 MiB were not bound for the idle time go back in place
     // (ProcessDemotions: only blocks of the game's direct memory without GPU-written data).
     const u64 tick = scheduler.CurrentTick();
@@ -1435,8 +1528,8 @@ void BufferCache::ProcessIdleBlocks() {
             continue; // in place
         }
         for (u64 block = range.start; block < range.end; ++block) {
-            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] >= VramIdleSeconds()) {
-                demotions_waiting.push_back({block, tick, false, true});
+            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] >= idle_limit) {
+                demotions_waiting.push_back({block, tick, false, true, tight});
             }
         }
     }
@@ -1445,12 +1538,13 @@ void BufferCache::ProcessIdleBlocks() {
     // into fuller chunks (AllocateResidency), and the chunk empties. Free slots spread evenly
     // (half of 1.3 GiB) left no chunk empty. One chunk every 10 s, each once a minute at most
     // (blocks with GPU-written data stay).
-    if (free_slot_count * block_size >= 128_MB && now - last_evacuation >= 10) {
+    if ((tight || free_slot_count * block_size >= 128_MB) &&
+        now - last_evacuation >= (tight ? 1u : 10u)) {
         auto sparsest = residency_chunks.end();
         for (auto it = residency_chunks.begin(); it != residency_chunks.end(); ++it) {
             const ResidencyChunk& chunk = it->second;
             if (it->first == static_cast<VkDeviceMemory>(residency_memory) || chunk.used == 0 ||
-                now - chunk.evacuated_second < 60) {
+                now - chunk.evacuated_second < (tight ? 5u : 60u)) {
                 continue;
             }
             if (sparsest == residency_chunks.end() || chunk.used < sparsest->second.used) {
@@ -1461,7 +1555,7 @@ void BufferCache::ProcessIdleBlocks() {
             sparsest == residency_chunks.end()
                 ? 0
                 : (free_slot_count - sparsest->second.free_offsets.size()) * block_size;
-        if (sparsest != residency_chunks.end() && sparsest->second.used <= free_elsewhere) {
+        if (sparsest != residency_chunks.end() && (tight || sparsest->second.used <= free_elsewhere)) {
             sparsest->second.evacuated_second = now;
             last_evacuation = now;
             BbStats::evacuations.fetch_add(1, std::memory_order_relaxed);
@@ -2134,6 +2228,9 @@ void BufferCache::QueuePromotions(u64 submitted) {
         }
     }
     promote_candidates.Clear();
+    if (VramTight()) {
+        return; // bbport: promotion is an optimization; with VRAM nearly full the blocks stay in place
+    }
     u64 moved = 0;
     for (const u64 block : blocks) {
         const VAddr address = block << block_shift;

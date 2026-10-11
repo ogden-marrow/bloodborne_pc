@@ -73,7 +73,7 @@ private:
                                      VideoCore::MemoryType type);
     StagingBufferRef RequestLarge(u64 size, VideoCore::MemoryType type, bool deferred);
 
-    void TrimRing(Ring& ring);
+    void TrimRing(Ring& ring, bool device_local, bool tight);
     void TrimLarge(std::vector<LargeBuffer>& cache);
 
     void PublishStats() const;
@@ -83,6 +83,7 @@ private:
 
     std::array<Ring, NUM_TYPES> rings;
     u64 keep_blocks = 0; ///< bbport: ring blocks never trimmed
+    bool vram_tight = false; ///< bbport: VRAM nearly full at the last check
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
 };
