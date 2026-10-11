@@ -294,7 +294,8 @@ private:
     void QueueCopyBacks(u64 submitted);
     void QueuePromotions(u64 submitted);
     /// Arena residency memory from the 64 MiB blocks: the memory and the byte offset in it.
-    std::pair<vk::DeviceMemory, u64> AllocateResidency(u64 bytes);
+    /// may_fail: a null memory comes back when VRAM has no room (the caller binds the blocks in place).
+    std::pair<vk::DeviceMemory, u64> AllocateResidency(u64 bytes, bool may_fail = false);
     bool VramTight();
     /// bbport: BbStats::residency_unused_bytes after the free list or the current block changed.
     void NoteResidencyUnused();
@@ -413,7 +414,6 @@ private:
     std::array<std::unique_ptr<Buffer>, 256> chunk_buffers{}; ///< per guest memory chunk (Chunk::index)
 
     u32 arena_memory_type_index{};
-    u32 arena_host_memory_type_index{UINT32_MAX}; ///< bbport: system-memory fallback type
     vk::DeviceMemory residency_memory{}; ///< bbport: the 64 MiB block arena residency comes from
     u64 residency_size = 0, residency_used = 0;
     std::future<vk::DeviceMemory> spare_residency; ///< the next block, allocated in the background
@@ -436,6 +436,7 @@ private:
         u32 evacuated_second = 0;      ///< when its blocks were last sent away (ProcessIdleBlocks)
     };
     std::unordered_map<VkDeviceMemory, ResidencyChunk> residency_chunks;
+    std::atomic<bool> vram_emergency{false}; ///< bbport: an allocation is waiting for VRAM
     u32 idle_scan_second = 0;
     u32 last_evacuation = 0; ///< ProcessIdleBlocks: when a chunk was last emptied
     u32 block_size{};

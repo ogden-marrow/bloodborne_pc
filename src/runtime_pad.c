@@ -368,7 +368,23 @@ static void record_sample(const PadData *d) {
     if (!checked) { path=getenv("BB_PAD_RECORD"); checked=1; }
     if (!path || !*path || !sdl_ready) return;
     const bool *k=SDL_GetKeyboardState(NULL);
-    const int f9=k && k[SDL_SCANCODE_F9];
+    int f9=k && k[SDL_SCANCODE_F9];
+    /* BB_PAD_RECORD_CTL=<file>: a script starts and stops the recording like F9 does: the file
+     * holds the word "toggle" (or "start" / "stop"); it is emptied once read (checked 5x a second). */
+    static const char *ctl; static int ctl_checked; static uint64_t ctl_last;
+    if (!ctl_checked) { ctl=getenv("BB_PAD_RECORD_CTL"); ctl_checked=1; }
+    if (ctl && *ctl && now_us()-ctl_last>200000) {
+        ctl_last=now_us();
+        FILE *c=fopen(ctl,"r");
+        if (c) {
+            char word[16]={0};
+            if (fscanf(c,"%15s",word)==1) {
+                if (!strcmp(word,"toggle") || (!strcmp(word,"start") && !record_file) ||
+                    (!strcmp(word,"stop") && record_file)) f9=1;
+                fclose(c); if ((c=fopen(ctl,"w"))) fclose(c);
+            } else fclose(c);
+        }
+    }
     if (f9 && !f9_was_down) {
         if (record_file) {
             fclose(record_file); record_file=NULL;

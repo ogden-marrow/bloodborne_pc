@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/buffer_cache/residency_policy.h"
+#include <cstdio>
+#include <cstdarg>
+#include <thread>
+#include <chrono>
 #include <chrono>
 #include <array>
 #include <map>
@@ -37,6 +42,43 @@ extern "C" int runtime_memory_vma_info(uintptr_t address, int* prot, int* type, 
 extern "C" int runtime_memory_direct_phys(uintptr_t address, uint64_t* phys, uintptr_t* end);
 
 namespace VideoCore {
+
+// bbport: BB_MEM_TRACE=<file> writes one line per memory event (time in ms, event letter, arguments) for
+// the offline residency simulator (tools/memsim.py). Off (one relaxed load) when the variable is not set.
+//   H block_shift group_bits     start of trace            U group        a 2 MiB group was used (once a second)
+//   V a b / I a b                blocks [a,b) bound to a VRAM chunk / in place
+//   X block flags                demoted in place (flags: 1 idle, 2 forced)   E block   evicted from VRAM
+//   A bytes ok                   residency allocation      F bytes        residency chunk freed
+//   G used budget tight emerg    once a second: VRAM use and the driver's budget (MiB)
+namespace BbTrace {
+static std::FILE* file = [] {
+    const char* path = std::getenv("BB_MEM_TRACE");
+    return path && *path ? std::fopen(path, "w") : nullptr;
+}();
+static std::mutex mutex;
+static const auto start = std::chrono::steady_clock::now();
+[[gnu::format(printf, 1, 2)]] static void Event(const char* format, ...) {
+    if (!file) {
+        return;
+    }
+    std::scoped_lock lock{mutex};
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    std::fprintf(file, "%lld ", static_cast<long long>(ms));
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(file, format, args);
+    va_end(args);
+    std::fputc('\n', file);
+}
+static void Flush() {
+    if (file) {
+        std::scoped_lock lock{mutex};
+        std::fflush(file);
+    }
+}
+} // namespace BbTrace
 
 namespace {
 // bbport: the tick of the newest GPU write per 64 KiB of guest memory, per 1 MiB for writes over
@@ -514,22 +556,14 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
     blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
+    BbTrace::Event("H %llu %llu", static_cast<unsigned long long>(block_shift),
+                   static_cast<unsigned long long>(USE_GROUP_BITS));
     group_use.assign(u64{1} << (ADDRESS_SPACE_BITS - USE_GROUP_BITS), 0);
     group_demoted.assign(group_use.size(), 0);
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
             .value();
-    // bbport: system memory the arenas can also be bound to, for when VRAM is full (4 GB GPUs):
-    // slower (PCIe) but the game goes on. UINT32_MAX: none.
-    arena_host_memory_type_index =
-        FindMemoryType(instance.GetMemoryProperties(),
-                       vk::MemoryPropertyFlagBits::eHostVisible |
-                           vk::MemoryPropertyFlagBits::eHostCoherent,
-                       reqs.memoryTypeBits)
-            .value_or(UINT32_MAX);
-    LOG_WARNING(Render_Vulkan, "Arena memory types: device-local {}, host fallback {} (sparse bits {:#x})",
-             arena_memory_type_index, arena_host_memory_type_index, reqs.memoryTypeBits);
 
     const u64 bda_pagetable_size =
         (blocks_per_arena_page * NUM_ARENA_PAGES) * sizeof(vk::DeviceAddress);
@@ -1267,10 +1301,30 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             }
         }
         if (vram_blocks != 0) {
-            auto [memory, memory_offset] = AllocateResidency(vram_blocks << block_shift);
-            for (const auto& range : rest_ranges) {
-                binds.push_back({range.start, range.end, memory, memory_offset});
-                memory_offset += (range.end - range.start) << block_shift;
+            auto alloc = AllocateResidency(vram_blocks << block_shift, GuestInPlace());
+            if (!alloc.first) {
+                // bbport: no VRAM left: the blocks of the game's direct memory are read in place (system
+                // memory over PCIe: slower, but the game goes on); only what cannot be bound there still
+                // needs VRAM.
+                IntervalList still_rest;
+                for (const auto& range : rest_ranges) {
+                    BindInPlace(range.start, range.end, binds, still_rest, true);
+                }
+                rest_ranges = std::move(still_rest);
+                vram_blocks = 0;
+                for (const auto& range : rest_ranges) {
+                    vram_blocks += range.end - range.start;
+                }
+                if (vram_blocks != 0) {
+                    alloc = AllocateResidency(vram_blocks << block_shift);
+                }
+            }
+            if (vram_blocks != 0) {
+                u64 memory_offset = alloc.second;
+                for (const auto& range : rest_ranges) {
+                    binds.push_back({range.start, range.end, alloc.first, memory_offset});
+                    memory_offset += (range.end - range.start) << block_shift;
+                }
             }
         }
     }
@@ -1286,6 +1340,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& bind : binds) {
+        BbTrace::Event("%c %llu %llu", residency_chunks.contains(static_cast<VkDeviceMemory>(bind.memory)) ? 'V' : 'I',
+                       static_cast<unsigned long long>(bind.start), static_cast<unsigned long long>(bind.end));
         Backing backing;
         backing.start = bind.start;
         backing.end = bind.end;
@@ -1324,7 +1380,14 @@ bool BufferCache::VramTight() {
     }();
     // The driver's budget now (it shrinks when the desktop or another app takes VRAM), not the
     // one taken at start.
-    const u64 budget = instance.GetDeviceMemoryBudgetNow();
+    static const u64 fake_budget = [] {
+        const char* env = std::getenv("BB_FAKE_VRAM_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0ull;
+    }();
+    u64 budget = instance.GetDeviceMemoryBudgetNow();
+    if (fake_budget && fake_budget < budget) {
+        budget = fake_budget;
+    }
     const u64 used = instance.GetDeviceMemoryUsage();
     static std::atomic<bool> reported{false};
     if (used + headroom > budget && !reported.exchange(true)) {
@@ -1343,7 +1406,7 @@ bool BufferCache::VramTight() {
     return used + headroom > budget;
 }
 
-std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
+std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes, bool may_fail) {
     if (bytes == block_size && free_slot_count != 0) {
         // bbport: a slot of the fullest chunk: the emptier ones drain and go back to the driver.
         auto best = residency_chunks.end();
@@ -1380,7 +1443,16 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
     // bbport: the spare block is only an optimization (allocated ahead, in the background). On a
     // GPU with little VRAM (4 GB) a failed spare must not stop the game: it returns a null handle
     // and the block is allocated when it is needed (or, by then, there is room again).
+    // BB_FAKE_VRAM_MB=N (tests): residency allocations fail while device memory in use plus the request
+    // would pass N MiB, and VramTight() sees N as the budget: the out-of-memory path without a ballast.
+    static const u64 fake_limit = [] {
+        const char* env = std::getenv("BB_FAKE_VRAM_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0ull;
+    }();
     const auto try_allocate = [this](u64 size, u32 type) -> vk::DeviceMemory {
+        if (fake_limit && instance.GetDeviceMemoryUsage() + size > fake_limit) {
+            return {};
+        }
         vk::DeviceMemory memory{};
         const vk::MemoryAllocateInfo info{.allocationSize = size, .memoryTypeIndex = type};
         const auto result = instance.GetDevice().allocateMemory(&info, nullptr, &memory);
@@ -1408,15 +1480,22 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
             size = Common::AlignUp(bytes, 4_MB);
             block = try_allocate(size, arena_memory_type_index);
         }
-        if (!block && arena_host_memory_type_index != UINT32_MAX) {
-            // bbport: no VRAM left: system memory (the GPU reads it over PCIe) rather than a crash.
-            block = try_allocate(size, arena_host_memory_type_index);
-            static std::atomic<bool> reported{false};
-            if (block && !reported.exchange(true)) {
-                LOG_WARNING(Render_Vulkan,
-                            "VRAM is full: guest memory chunks now go to system memory (slower)");
+        if (!block) {
+            // bbport: VRAM is full. The next reclaim pass (Maintain, on the GPU command thread) gives back
+            // everything idle. Waiting here does not help (that thread depends on this one: every wait
+            // of 2 s failed in tests), so the caller decides: bind the blocks in place (may_fail) or stop.
+            vram_emergency.store(true, std::memory_order_relaxed);
+            static std::atomic<u64> failures{0};
+            if (const u64 n = failures.fetch_add(1, std::memory_order_relaxed); (n & (n + 1)) == 0) {
+                LOG_WARNING(Render_Vulkan, "VRAM is full: residency block of {} KiB refused ({} so far){}",
+                            size >> 10, n + 1, may_fail ? ", reading those blocks in place" : "");
+            }
+            if (may_fail) {
+                BbTrace::Event("A %llu 0", static_cast<unsigned long long>(size));
+                return {vk::DeviceMemory{}, 0};
             }
         }
+        BbTrace::Event("A %llu %d", static_cast<unsigned long long>(size), block ? 1 : 0);
         residency_memory = block ? block : allocate(size);
         residency_size = size;
         residency_used = 0;
@@ -1453,6 +1532,7 @@ void BufferCache::NoteUse(VAddr address, u64 size) {
     for (u64 group = address >> USE_GROUP_BITS; group <= last; ++group) {
         if (group_use[group] != now) {
             group_use[group] = now;
+            BbTrace::Event("U %llu", static_cast<unsigned long long>(group));
         }
         if (group_demoted[group]) [[unlikely]] {
             group_demoted[group] = 0;
@@ -1489,6 +1569,7 @@ void BufferCache::EvictVramBlock(u64 block) {
     const vk::DeviceMemory memory = old->memory;
     const u64 offset = (old->offset + (block - old->start)) << block_shift;
     const VAddr address = block << block_shift;
+    BbTrace::Event("E %llu", static_cast<unsigned long long>(block));
     for (const auto& arena : arenas) {
         if (arena.cpu_addr <= address && address - arena.cpu_addr < arena.size_bytes) {
             BindsForArena(&arena)->binds.emplace_back(vk::SparseMemoryBind{
@@ -1511,15 +1592,27 @@ void BufferCache::EvictVramBlock(u64 block) {
 
 void BufferCache::ProcessIdleBlocks() {
     const u32 now = BbStats::coarse_second.load(std::memory_order_relaxed);
-    if (now == idle_scan_second || !GuestInPlace() || VramIdleSeconds() == 0) {
+    // bbport: an allocation failed (AllocateResidency): everything idle goes back in place and the
+    // empty chunks are freed now, on every pass, until the allocation has gone through.
+    const bool emergency = vram_emergency.load(std::memory_order_relaxed);
+    if ((now == idle_scan_second && !emergency) || !GuestInPlace() || VramIdleSeconds() == 0) {
         return;
     }
     idle_scan_second = now;
+    if (emergency) {
+        vram_emergency.store(false, std::memory_order_relaxed);
+    }
     // bbport: with VRAM nearly full (4 GB GPUs) the blocks go back in place after 2 s unused rather
     // than 60 s, and a chunk is emptied every second: a big area fills VRAM far faster than the
     // timers allow, and the game then reads what it does not need now over PCIe, not from VRAM.
-    const bool tight = VramTight();
-    const u32 idle_limit = tight ? 2u : VramIdleSeconds();
+    const bool tight = emergency || VramTight();
+    const u32 idle_limit = ResidencyPolicy::IdleLimit(tight, emergency, VramIdleSeconds());
+    if (BbTrace::file) {
+        BbTrace::Event("G %llu %llu %d %d", static_cast<unsigned long long>(instance.GetDeviceMemoryUsage() >> 20),
+                       static_cast<unsigned long long>(instance.GetDeviceMemoryBudgetNow() >> 20), tight ? 1 : 0,
+                       emergency ? 1 : 0);
+        BbTrace::Flush();
+    }
     // Blocks in VRAM whose 2 MiB were not bound for the idle time go back in place
     // (ProcessDemotions: only blocks of the game's direct memory without GPU-written data).
     const u64 tick = scheduler.CurrentTick();
@@ -1528,7 +1621,7 @@ void BufferCache::ProcessIdleBlocks() {
             continue; // in place
         }
         for (u64 block = range.start; block < range.end; ++block) {
-            if (now - group_use[(block << block_shift) >> USE_GROUP_BITS] >= idle_limit) {
+            if (ResidencyPolicy::IdleLongEnough(now, group_use[(block << block_shift) >> USE_GROUP_BITS], idle_limit)) {
                 demotions_waiting.push_back({block, tick, false, true, tight});
             }
         }
@@ -1539,12 +1632,12 @@ void BufferCache::ProcessIdleBlocks() {
     // (half of 1.3 GiB) left no chunk empty. One chunk every 10 s, each once a minute at most
     // (blocks with GPU-written data stay).
     if ((tight || free_slot_count * block_size >= 128_MB) &&
-        now - last_evacuation >= (tight ? 1u : 10u)) {
+        (emergency || now - last_evacuation >= ResidencyPolicy::EvacuationInterval(tight, emergency))) {
         auto sparsest = residency_chunks.end();
         for (auto it = residency_chunks.begin(); it != residency_chunks.end(); ++it) {
             const ResidencyChunk& chunk = it->second;
             if (it->first == static_cast<VkDeviceMemory>(residency_memory) || chunk.used == 0 ||
-                now - chunk.evacuated_second < (tight ? 5u : 60u)) {
+                (!emergency && now - chunk.evacuated_second < ResidencyPolicy::EvacuationCooldown(tight, emergency))) {
                 continue;
             }
             if (sparsest == residency_chunks.end() || chunk.used < sparsest->second.used) {
@@ -1574,7 +1667,7 @@ void BufferCache::ProcessIdleBlocks() {
         const ResidencyChunk& chunk = it->second;
         const VkDeviceMemory memory = it->first;
         if (chunk.used != 0 || memory == static_cast<VkDeviceMemory>(residency_memory) ||
-            now - chunk.empty_second < 5 || !pending_binds.empty() ||
+            now - chunk.empty_second < ResidencyPolicy::EmptyChunkDelay(tight, emergency) || !pending_binds.empty() ||
             !scheduler.GetWorkSemaphore()->IsFree(chunk.empty_tick + 1)) {
             ++it;
             continue;
@@ -1584,6 +1677,7 @@ void BufferCache::ProcessIdleBlocks() {
         BbStats::residency_alloc_bytes.fetch_sub(chunk.size, std::memory_order_relaxed);
         BbStats::device_free_bytes.fetch_add(chunk.size, std::memory_order_relaxed);
         BbStats::vram_chunks_freed_bytes.fetch_add(chunk.size, std::memory_order_relaxed);
+        BbTrace::Event("F %llu", static_cast<unsigned long long>(chunk.size));
         it = residency_chunks.erase(it);
         NoteResidencyUnused();
     }
@@ -1771,6 +1865,7 @@ void BufferCache::ProcessDemotions() {
         resident_ranges.Subtract(block, block + 1);
         resident_ranges.Add(backing);
         in_place_blocks.Add({block, block + 1});
+        BbTrace::Event("X %llu %d", static_cast<unsigned long long>(block), (idle ? 1 : 0) | (force ? 2 : 0));
         // Every arena over it: one replaced by a wider one (GetArena) still serves the shaders
         // whose device addresses (the BDA page table) were taken from it.
         for (const auto& arena : arenas) {
@@ -2239,9 +2334,12 @@ void BufferCache::QueuePromotions(u64 submitted) {
             !VramEligible(block)) {
             continue;
         }
+        const auto [memory, offset] = AllocateResidency(block_size, true);
+        if (!memory) {
+            break; // bbport: no VRAM left: promotion is only an optimization
+        }
         memory_tracker->UnmarkRegionAsGpuModified(address, block_size);
         gpu_modified_ranges.Subtract(address, block_size);
-        const auto [memory, offset] = AllocateResidency(block_size);
         Backing backing;
         backing.start = block;
         backing.end = block + 1;
