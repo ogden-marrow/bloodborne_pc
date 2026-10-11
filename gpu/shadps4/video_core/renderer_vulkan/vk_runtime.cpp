@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <execinfo.h>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <boost/container/small_vector.hpp>
 #include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -305,6 +309,19 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                             std::span<const vk::BufferImageCopy> download_copies) {
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
+    // BB_TRACE_DOWNLOAD=1: print the call stack of the first few image downloads (which code asks for them).
+    if (static const bool trace = std::getenv("BB_TRACE_DOWNLOAD") != nullptr; trace) {
+        static std::atomic<int> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 6) {
+            void* frames[24];
+            const int n = backtrace(frames, 24);
+            std::fprintf(stderr, "image download %ux%u fmt %d tiled %d guest %#llx size %#llx:\n",
+                         src->info.size.width, src->info.size.height, int(src->info.pixel_format),
+                         int(src->info.props.is_tiled), (unsigned long long)src->info.guest_address,
+                         (unsigned long long)src->info.guest_size);
+            backtrace_symbols_fd(frames, n, 2);
+        }
+    }
     const TransferMark mark{*this, "image download", *src};
 
     bool needs_flush =
