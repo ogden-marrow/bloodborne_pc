@@ -1595,7 +1595,10 @@ void BufferCache::ProcessIdleBlocks() {
     // bbport: an allocation failed (AllocateResidency): everything idle goes back in place and the
     // empty chunks are freed now, on every pass, until the allocation has gone through.
     const bool emergency = vram_emergency.load(std::memory_order_relaxed);
-    if ((now == idle_scan_second && !emergency) || !GuestInPlace() || VramIdleSeconds() == 0) {
+    // bbport: the default (old) memory model has no in-place binding: its VRAM copies mirror guest memory
+    // and used to be released only when the game unmapped it, so VRAM grew with every area visited.
+    const bool old_model = !GuestInPlace();
+    if ((now == idle_scan_second && !emergency) || VramIdleSeconds() == 0) {
         return;
     }
     idle_scan_second = now;
@@ -1613,6 +1616,39 @@ void BufferCache::ProcessIdleBlocks() {
                        emergency ? 1 : 0);
         BbTrace::Flush();
     }
+    if (old_model) {
+        // Under pressure only: copies idle for the window that hold nothing the GPU wrote are dropped (the
+        // guest memory stays authoritative; EnsureResident uploads them again on the next use). GPU-modified
+        // blocks stay: dropping one would lose data that exists only in VRAM.
+        if (tight) {
+            std::vector<u64> cold;
+            constexpr size_t MaxPerPass = 4096;
+            for (const auto& range : resident_ranges) {
+                if (!residency_chunks.contains(static_cast<VkDeviceMemory>(range.memory))) {
+                    continue;
+                }
+                for (u64 block = range.start; block < range.end && cold.size() < MaxPerPass; ++block) {
+                    const VAddr address = block << block_shift;
+                    if (ResidencyPolicy::IdleLongEnough(now, group_use[address >> USE_GROUP_BITS], idle_limit) &&
+                        !IsRegionGpuModified(address, block_size) &&
+                        !gpu_modified_ranges.Intersects(address, block_size)) {
+                        cold.push_back(block);
+                    }
+                }
+            }
+            for (const u64 block : cold) {
+                EvictVramBlock(block);
+            }
+            static std::atomic<u64> passes{0};
+            if (!cold.empty()) {
+                if (const u64 n = passes.fetch_add(1, std::memory_order_relaxed); (n & (n + 1)) == 0) {
+                    LOG_WARNING(Render_Vulkan, "VRAM is tight: dropped {} MiB of cold VRAM copies [{} passes]",
+                                (cold.size() * block_size) >> 20, n + 1);
+                }
+            }
+        }
+    }
+    if (!old_model) {
     // Blocks in VRAM whose 2 MiB were not bound for the idle time go back in place
     // (ProcessDemotions: only blocks of the game's direct memory without GPU-written data).
     const u64 tick = scheduler.CurrentTick();
@@ -1662,6 +1698,7 @@ void BufferCache::ProcessIdleBlocks() {
             }
         }
     }
+    } // !old_model
     // Chunks without blocks for 5 s, the rebinds away from them long done: back to the driver.
     for (auto it = residency_chunks.begin(); it != residency_chunks.end();) {
         const ResidencyChunk& chunk = it->second;
