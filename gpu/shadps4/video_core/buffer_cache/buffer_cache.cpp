@@ -1620,7 +1620,14 @@ void BufferCache::ProcessIdleBlocks() {
         // Under pressure only: copies idle for the window that hold nothing the GPU wrote are dropped (the
         // guest memory stays authoritative; EnsureResident uploads them again on the next use). GPU-modified
         // blocks stay: dropping one would lose data that exists only in VRAM.
-        if (tight) {
+        // OFF by default (BB_OLD_MODEL_EVICT=1 enables it): the last-use tracking behind "cold" is only fed by
+        // EnsureResident, so blocks a shader keeps reading (via a cached binding or a device address) can look
+        // idle; evicting them made the background flicker black in B5. Needs reliable use tracking first.
+        static const bool evict_enabled = [] {
+            const char* env = std::getenv("BB_OLD_MODEL_EVICT");
+            return env && env[0] == '1';
+        }();
+        if (tight && evict_enabled) {
             std::vector<u64> cold;
             constexpr size_t MaxPerPass = 4096;
             for (const auto& range : resident_ranges) {
