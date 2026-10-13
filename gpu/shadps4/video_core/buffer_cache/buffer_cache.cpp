@@ -1560,6 +1560,14 @@ void BufferCache::ReleaseResidencySlot(vk::DeviceMemory memory, u64 offset) {
     NoteResidencyUnused();
 }
 
+void BufferCache::PinBlocks(VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    std::scoped_lock lock{pinned_mutex};
+    pinned_blocks.Add({addr >> block_shift, ((addr + size - 1) >> block_shift) + 1});
+}
+
 void BufferCache::EvictVramBlock(u64 block) {
     const auto old = resident_ranges.Find(block);
     if (old == resident_ranges.end() || in_place_blocks.Contains(block) ||
@@ -1630,14 +1638,22 @@ void BufferCache::ProcessIdleBlocks() {
         if (tight && evict_enabled) {
             std::vector<u64> cold;
             constexpr size_t MaxPerPass = 4096;
+            // A 2 s window evicted blocks that were needed again within 2 s in 24% of cases (offline, tools/
+            // window_tune.py on B5's trace); 15 s: 5%, and still frees ~640 MiB on average.
+            static const u32 evict_window = [] {
+                const char* env = std::getenv("BB_OLD_MODEL_EVICT_WINDOW");
+                return env ? u32(std::strtoul(env, nullptr, 10)) : 15u;
+            }();
+            const u32 window = std::max(idle_limit, evict_window);
+            std::scoped_lock pin_lock{pinned_mutex};
             for (const auto& range : resident_ranges) {
                 if (!residency_chunks.contains(static_cast<VkDeviceMemory>(range.memory))) {
                     continue;
                 }
                 for (u64 block = range.start; block < range.end && cold.size() < MaxPerPass; ++block) {
                     const VAddr address = block << block_shift;
-                    if (ResidencyPolicy::IdleLongEnough(now, group_use[address >> USE_GROUP_BITS], idle_limit) &&
-                        !IsRegionGpuModified(address, block_size) &&
+                    if (ResidencyPolicy::IdleLongEnough(now, group_use[address >> USE_GROUP_BITS], window) &&
+                        !pinned_blocks.Contains(block) && !IsRegionGpuModified(address, block_size) &&
                         !gpu_modified_ranges.Intersects(address, block_size)) {
                         cold.push_back(block);
                     }

@@ -141,6 +141,8 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    /// bbport: marks the blocks of [addr, addr+size) as read by device address: never evicted.
+    void PinBlocks(VAddr addr, u64 size);
 
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
@@ -387,6 +389,10 @@ private:
     };
     std::vector<Demotion> demotions_waiting;
     IntervalList<> dynamic_blocks;                     ///< bound in place even when Garlic
+    /// bbport: blocks a shader read through a device address while they were not resident (the fault buffer).
+    /// The use tracking cannot see such reads, so these blocks are never evicted (BB_OLD_MODEL_EVICT).
+    IntervalList<> pinned_blocks;
+    std::mutex pinned_mutex;
     /// Bytes last written through a path the GPU side hears of (file reads, the game's resource
     /// loaders, DMA) and not handed out again by the game's GPU memory allocator since. Only blocks
     /// made of such bytes keep a VRAM copy: anything else in a block may be written by code we do

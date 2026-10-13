@@ -173,6 +173,7 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
+            buffer_cache.PinBlocks(start, end - start); // read by device address: the use tracking cannot see it
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
         });
         fault_areas[area] = 0;
