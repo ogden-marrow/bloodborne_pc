@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include "video_core/renderer_vulkan/vk_alloc_tiers.h"
 #include "bbport_toggles.h"
 #include <ranges>
 #include "common/assert.h"
@@ -131,21 +132,20 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                     &allocation, &alloc_info);
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-        // bbport: tier 2. WITHIN_BUDGET makes the allocator refuse once the driver's budget (about
-        // 80-90% of the heap) is reached although physical memory may remain: ask again without it
-        // before giving up. A genuine driver refusal still fails below.
-        VmaAllocationCreateInfo no_budget = alloc_ci;
-        no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &no_budget, &unsafe_image, &allocation,
-                                &alloc_info);
+    // bbport: tiered allocation (Vulkan::AllocateInTiers, unit tested): within the driver's budget, then
+    // without it (WITHIN_BUDGET refuses at ~80-90% of the heap although physical memory may remain).
+    VmaAllocationCreateInfo no_budget = alloc_ci;
+    no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    const auto outcome = Vulkan::AllocateInTiers<VkResult>(VK_ERROR_OUT_OF_DEVICE_MEMORY, {
+        [&] { return vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation, &alloc_info); },
+        [&] { return vmaCreateImage(allocator, &image_ci_unsafe, &no_budget, &unsafe_image, &allocation, &alloc_info); },
+    });
+    VkResult result = outcome.result;
+    if (outcome.tier > 0) {
         static std::atomic<u64> retries{0};
         if (const u64 n = retries.fetch_add(1, std::memory_order_relaxed); (n & (n + 1)) == 0) {
             LOG_WARNING(Render_Vulkan,
-                        "Image of {} KiB refused within the VRAM budget: asked again without it ({}) "
-                        "[{} times]",
+                        "Image of {} KiB refused within the VRAM budget: allocated without it ({}) [{} times]",
                         alloc_info.size >> 10, result == VK_SUCCESS ? "ok" : "failed", n + 1);
         }
     }

@@ -148,6 +148,9 @@ target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::X11 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
+add_executable(alloc-tiers-test EXCLUDE_FROM_ALL ../tests/test_alloc_tiers.cpp)
+target_compile_options(alloc-tiers-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(alloc-tiers-test PRIVATE ..)
 add_executable(residency-policy-test EXCLUDE_FROM_ALL ../tests/test_residency_policy.cpp)
 target_compile_options(residency-policy-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(residency-policy-test PRIVATE ..)

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_alloc_tiers.h"
 #include <numeric>
 
 #include "common/alignment.h"
@@ -99,26 +100,27 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 
         const VkBufferCreateInfo buffer_ci_unsafe = static_cast<VkBufferCreateInfo>(buffer_ci);
         VkBuffer unsafe_buffer{};
-        VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
-                                          &allocation, out_alloc_info);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-            // bbport: tier 2: ask again without the budget limit (physical memory may remain).
-            VmaAllocationCreateInfo no_budget = alloc_ci;
-            no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &no_budget, &unsafe_buffer,
-                                     &allocation, out_alloc_info);
-            // tier 3: a buffer without a device address can live in host memory (slower over PCIe,
-            // but the game goes on); one that needs a device address cannot move.
-            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !with_bda &&
-                mem_type == MemoryType::DeviceLocal) {
-                VmaAllocationCreateInfo host = alloc_ci;
-                host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-                host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-                result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &host, &unsafe_buffer,
-                                         &allocation, out_alloc_info);
-                LOG_WARNING(Render_Vulkan, "Device-local buffer of {} KiB placed in host memory ({})",
-                            buffer_ci.size >> 10, result == VK_SUCCESS ? "ok" : "failed");
-            }
+        // bbport: tiered allocation (Vulkan::AllocateInTiers, unit tested): within budget, without the budget
+        // limit, then host memory for a device-local buffer that needs no device address (slower over PCIe,
+        // but the game goes on).
+        VmaAllocationCreateInfo no_budget = alloc_ci;
+        no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        VmaAllocationCreateInfo host = alloc_ci;
+        host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+        host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+        const bool may_use_host = !with_bda && mem_type == MemoryType::DeviceLocal;
+        const auto outcome = Vulkan::AllocateInTiers<VkResult>(VK_ERROR_OUT_OF_DEVICE_MEMORY, {
+            [&] { return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer, &allocation, out_alloc_info); },
+            [&] { return vmaCreateBuffer(allocator, &buffer_ci_unsafe, &no_budget, &unsafe_buffer, &allocation, out_alloc_info); },
+            [&] {
+                return may_use_host ? vmaCreateBuffer(allocator, &buffer_ci_unsafe, &host, &unsafe_buffer, &allocation, out_alloc_info)
+                                    : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            },
+        });
+        VkResult result = outcome.result;
+        if (outcome.tier > 0) {
+            LOG_WARNING(Render_Vulkan, "Buffer of {} KiB: allocation tier {} used ({})", buffer_ci.size >> 10,
+                        outcome.tier + 1, result == VK_SUCCESS ? "ok" : "failed");
         }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
