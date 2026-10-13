@@ -101,6 +101,25 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // bbport: tier 2: ask again without the budget limit (physical memory may remain).
+            VmaAllocationCreateInfo no_budget = alloc_ci;
+            no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &no_budget, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+            // tier 3: a buffer without a device address can live in host memory (slower over PCIe,
+            // but the game goes on); one that needs a device address cannot move.
+            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !with_bda &&
+                mem_type == MemoryType::DeviceLocal) {
+                VmaAllocationCreateInfo host = alloc_ci;
+                host.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+                host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &host, &unsafe_buffer,
+                                         &allocation, out_alloc_info);
+                LOG_WARNING(Render_Vulkan, "Device-local buffer of {} KiB placed in host memory ({})",
+                            buffer_ci.size >> 10, result == VK_SUCCESS ? "ok" : "failed");
+            }
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};

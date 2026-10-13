@@ -342,6 +342,19 @@ static void PrintMemory() {
     const u64 device = BbStats::device_alloc_bytes.load() - BbStats::device_free_bytes.load();
     u64 vma_blocks = 0, vma_used = 0;
     Vulkan::VmaDeviceUsage(vma_blocks, vma_used);
+    {
+        // bbport: who holds the device memory, as one line (crash logs show the category that grew).
+        const u64 images = BbStats::vk_image_bytes.load();
+        const u64 residency = BbStats::residency_alloc_bytes.load();
+        const u64 buffers = vma_used > images ? vma_used - images : 0;
+        const u64 slack = vma_blocks > vma_used ? vma_blocks - vma_used : 0;
+        const u64 other = device > vma_blocks + residency ? device - vma_blocks - residency : 0;
+        std::printf("VRAM breakdown (MiB): images %llu | VMA buffers %llu | VMA slack %llu | residency %llu | "
+                    "other %llu (dedicated allocations, staging, targets) | total %llu\n",
+                    (unsigned long long)(images >> 20), (unsigned long long)(buffers >> 20),
+                    (unsigned long long)(slack >> 20), (unsigned long long)(residency >> 20),
+                    (unsigned long long)(other >> 20), (unsigned long long)(device >> 20));
+    }
     std::printf("Memory: VRAM %llu MiB, GTT %llu MiB, RSS %llu MiB; Vulkan memory %llu MiB "
                 "allocated (VMA blocks %llu MiB, %llu MiB of them used); Vulkan images %llu MiB; "
                 "cached images %llu MiB in %llu; guest blocks in VRAM %llu MiB allocated, "

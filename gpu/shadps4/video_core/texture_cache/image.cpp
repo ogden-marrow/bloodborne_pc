@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "bbport_toggles.h"
 #include <ranges>
 #include "common/assert.h"
@@ -132,6 +133,22 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // bbport: tier 2. WITHIN_BUDGET makes the allocator refuse once the driver's budget (about
+        // 80-90% of the heap) is reached although physical memory may remain: ask again without it
+        // before giving up. A genuine driver refusal still fails below.
+        VmaAllocationCreateInfo no_budget = alloc_ci;
+        no_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &no_budget, &unsafe_image, &allocation,
+                                &alloc_info);
+        static std::atomic<u64> retries{0};
+        if (const u64 n = retries.fetch_add(1, std::memory_order_relaxed); (n & (n + 1)) == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image of {} KiB refused within the VRAM budget: asked again without it ({}) "
+                        "[{} times]",
+                        alloc_info.size >> 10, result == VK_SUCCESS ? "ok" : "failed", n + 1);
+        }
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
