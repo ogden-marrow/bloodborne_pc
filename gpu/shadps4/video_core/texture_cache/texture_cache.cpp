@@ -294,6 +294,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
+        ReserveForImage(new_info.guest_size, new_info.guest_address, new_info.guest_address + new_info.guest_size);
         const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
 
@@ -545,6 +546,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    ReserveForImage(info.guest_size, info.guest_address, info.guest_address + info.guest_size);
     const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -668,6 +670,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        ReserveForImage(info.guest_size, info.guest_address, info.guest_address + info.guest_size);
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -818,6 +821,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
             info.guest_address = desc.info.stencil_addr;
             info.guest_size = desc.info.stencil_size;
             info.size = desc.info.size;
+            ReserveForImage(info.guest_size, info.guest_address, info.guest_address + info.guest_size);
             stencil_id = slot_images.insert(instance, runtime, slot_image_views, info);
             RegisterImage(stencil_id);
         }
@@ -1085,6 +1089,48 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         MarkAsMaybeDirty(image_id, image);
     }
     tracker.UpdatePageWatchers<false>(addr, size);
+}
+
+void TextureCache::ReserveForImage(u64 bytes, VAddr begin, VAddr end) {
+    if (!instance.CanReportMemoryUsage() || instance.IsIntegrated()) {
+        return;
+    }
+    static const u64 headroom = [] {
+        const char* env = std::getenv("BB_IMAGE_HEADROOM_MB");
+        return (env ? std::strtoull(env, nullptr, 10) : 256ull) << 20;
+    }();
+    const u64 used = instance.GetDeviceMemoryUsage();
+    const u64 budget = instance.GetDeviceMemoryBudgetNow();
+    if (used + bytes + headroom <= budget) {
+        return;
+    }
+    const u64 want = used + bytes + headroom - budget;
+    u64 freed = 0;
+    u32 visited = 0;
+    const u64 below_tick = gc_tick > 16 ? gc_tick - 16 : 0; // not touched in the last few submissions
+    lru_cache.ForEachItemBelow(below_tick, [&](ImageId image_id) {
+        if (freed >= want || ++visited > 256) {
+            return true;
+        }
+        Image& image = slot_images[image_id];
+        if (image.SafeToDownload()) {
+            return false; // GPU-written: its contents exist only here, leave it to the collector
+        }
+        if (image.guest_begin < end && image.guest_end > begin) {
+            return false; // overlaps the image about to be created: the caller may still be resolving it
+        }
+        freed += image.info.guest_size;
+        BbStats::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
+        FreeImage(image_id);
+        return false;
+    });
+    static std::atomic<u64> reports{0};
+    if (const u64 n = reports.fetch_add(1, std::memory_order_relaxed); (n & (n + 1)) == 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "Image of {} KiB would pass the VRAM budget ({} of {} MiB used): evicted {} MiB of clean "
+                    "textures first [{} times]",
+                    bytes >> 10, used >> 20, budget >> 20, freed >> 20, n + 1);
+    }
 }
 
 void TextureCache::GarbageCollectImages() {

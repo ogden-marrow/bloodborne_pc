@@ -355,6 +355,10 @@ private:
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
+    /// bbport: before an image of about `bytes` is created (mutex held): if the live budget would be
+    /// passed, evict least recently used CLEAN images (re-uploadable from guest memory; never GPU-written
+    /// ones, whose write-back would stall) until it fits. Proactive reclaim instead of failing later.
+    void ReserveForImage(u64 bytes, VAddr begin, VAddr end);
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
