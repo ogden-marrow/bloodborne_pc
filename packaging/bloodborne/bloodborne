@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Bloodborne (native port): one-command launcher.
+#   bloodborne [smooth|quality|battery] [--fresh] [--log] [--check] [--help]
+# Profiles (each keeps its own settings file in ~/.config/bloodborne-pc/, so changes made in the
+# in-game menu are remembered per profile):
+#   smooth   Ultra Performance upscaling, 50 FPS cap  (default; best frame times on a 4 GB laptop GPU)
+#   quality  Performance upscaling, 45 FPS cap        (sharper picture)
+#   battery  Ultra Performance upscaling, 30 FPS cap  (coolest and quietest)
+set -euo pipefail
+ROOT=@ROOT@
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/bloodborne-pc
+mkdir -p "$CONF"
+[[ -f $CONF/config ]] && . "$CONF/config"   # GAME_DIR=/path/to/CUSA03173
+GAME_DIR=${GAME_DIR:-${BB_GAME_DIR:-$HOME/Games/Bloodborne/CUSA03173}}
+
+profile=smooth fresh=0 log=0 check=0
+for a in "$@"; do
+    case $a in
+        smooth|quality|battery) profile=$a ;;
+        --fresh) fresh=1 ;; --log) log=1 ;; --check) check=1 ;;
+        -h|--help) sed -n 2,9p "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown option: $a (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+# Headers/libraries installed under ~/.local (newer Vulkan headers) are needed if the engine rebuilds itself.
+if [[ -d $HOME/.local/include ]]; then
+    export CPATH=$HOME/.local/include${CPATH:+:$CPATH} CMAKE_PREFIX_PATH=$HOME/.local${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}
+    export PKG_CONFIG_PATH=$HOME/.local/lib/pkgconfig:$HOME/.local/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+fi
+
+say() { echo "bloodborne: $*" >&2; }
+fail() {
+    say "$*"
+    if [[ -z ${TERM:-} || ! -t 2 ]] && command -v notify-send >/dev/null; then notify-send -a Bloodborne "Bloodborne" "$*"; fi
+    exit 1
+}
+
+[[ -f $GAME_DIR/eboot.bin ]] || fail "Game files not found in $GAME_DIR. Put the path in $CONF/config as GAME_DIR=..."
+[[ -x $ROOT/out/bb-probe ]] || fail "Not built yet: run $ROOT/build.sh first."
+if command -v vulkaninfo >/dev/null; then
+    vk=$(vulkaninfo --summary 2>/dev/null || true)
+    [[ $vk == *deviceName* ]] || fail "No Vulkan GPU found. Install the NVIDIA/Mesa Vulkan driver."
+fi
+(( check )) && { say "OK: game at $GAME_DIR, engine built, Vulkan present."; exit 0; }
+
+case $profile in
+    smooth)  preset=4 cap=50 ;;
+    quality) preset=3 cap=45 ;;
+    battery) preset=4 cap=30 ;;
+esac
+# First use of a profile: write its settings file (effects that cost the most are off; the rest is default).
+ini=$CONF/$profile.ini
+if [[ ! -f $ini ]]; then
+    cp "$ROOT/bbport.ini" "$ini"
+    sed -i -e "s/^preset=.*/preset=$preset/" -e 's/^output_res=.*/output_res=1920x1080/' "$ini"
+    for e in dof motion_blur ssao ssr dynamic_shadows chromatic_aberration; do
+        grep -q "^effect_$e=" "$ini" && sed -i "s/^effect_$e=.*/effect_$e=0/" "$ini"
+    done
+fi
+
+export BB_GAME_DIR=$GAME_DIR BB_CONFIG=$ini BB_FPS_LIMIT=${BB_FPS_LIMIT:-$cap}
+if (( fresh )); then
+    rm -rf "$CONF/fresh_save"; mkdir -p "$CONF/fresh_save"; export BB_USER_DIR=$CONF/fresh_save
+    say "Starting with a brand-new empty save (your real save is untouched)."
+fi
+(( log )) && export BB_SAVE_LOG=1
+say "Profile: $profile (FPS cap $BB_FPS_LIMIT). Starting..."
+cd "$ROOT"
+exec bash run.sh
