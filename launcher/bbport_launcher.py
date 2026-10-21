@@ -241,6 +241,26 @@ INI_DEFAULTS = {
 }
 
 
+def find_game_dir():
+    """The game folder (with eboot.bin) in the usual places, else an empty string."""
+    home = Path.home()
+    roots = [DATA_DIR / "CUSA03173", PORT_DIR.parent / "CUSA03173"]
+    for base in (home / "Games", home / "Games" / "Bloodborne", home / "Bloodborne", home / "Documents",
+                 home / "Downloads", home / ".local" / "share" / "bbport", Path("/opt"), Path("/mnt"), Path("/media")):
+        try:
+            roots.append(base)
+            roots.extend(child for child in sorted(base.iterdir()) if child.is_dir())
+        except OSError:
+            pass
+    for root in roots:
+        try:
+            if (root / "eboot.bin").is_file():
+                return str(root)
+        except OSError:
+            pass
+    return ""
+
+
 def load_settings():
     settings = dict(DEFAULTS)
     try:
@@ -252,6 +272,11 @@ def load_settings():
     for key, old_values in online.OLD_DEFAULTS.items():
         if str(settings.get(key, '')).strip() in old_values:
             settings[key] = DEFAULTS[key]
+    # No game folder yet, or one that moved: look in the usual places before asking.
+    if not (Path(settings.get("game_dir") or "/nonexistent").expanduser() / "eboot.bin").is_file():
+        found = find_game_dir()
+        if found:
+            settings["game_dir"] = found
     return settings
 
 

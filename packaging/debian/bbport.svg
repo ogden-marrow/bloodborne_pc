@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><radialGradient id="g" cx="50%" cy="40%" r="75%"><stop offset="0" stop-color="#5a1218"/><stop offset="1" stop-color="#0d0709"/></radialGradient></defs>
+<rect width="256" height="256" rx="48" fill="url(#g)"/>
+<circle cx="128" cy="120" r="62" fill="none" stroke="#d9c7a0" stroke-width="7"/>
+<path d="M128 40 L146 120 L128 200 L110 120 Z" fill="#d9c7a0"/>
+<path d="M66 120 L128 108 L190 120 L128 132 Z" fill="#8f1d27"/>
+<text x="128" y="238" font-family="serif" font-size="26" text-anchor="middle" fill="#d9c7a0" letter-spacing="6">BLOODBORNE</text></svg>

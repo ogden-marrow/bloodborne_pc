@@ -306,6 +306,10 @@ target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan:
 option(BB_NET "Build the online module (shadNet)" ON)
 if (BB_NET)
     find_package(Protobuf CONFIG QUIET)
+    if (NOT Protobuf_FOUND)
+        # Debian and Ubuntu ship no protobuf-config.cmake; CMake's own FindProtobuf module works there.
+        find_package(Protobuf QUIET)
+    endif()
     find_package(nlohmann_json CONFIG QUIET)
     find_package(OpenSSL QUIET)
     find_package(ZLIB QUIET)
