@@ -8,24 +8,29 @@ bin=$HOME/.local/bin
 apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 icons=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps
 if [[ ${1:-} == --uninstall ]]; then
-    rm -f "$bin/bloodborne" "$apps/bloodborne-pc.desktop" "$icons/bloodborne-pc.svg"
+    rm -f "$bin/bloodborne" "$bin/bloodborne-app" "$apps/bloodborne-pc.desktop" "$icons/bloodborne-pc.svg"
     echo "Removed. Settings in ~/.config/bloodborne-pc and your saves were left alone."; exit 0
 fi
 mkdir -p "$bin" "$apps" "$icons"
 sed "s|@ROOT@|$root|" "$here/bloodborne" > "$bin/bloodborne"; chmod +x "$bin/bloodborne"
 cp "$here/bloodborne.svg" "$icons/bloodborne-pc.svg"
+cp "$here/bloodborne-app.py" "$bin/bloodborne-app"; chmod +x "$bin/bloodborne-app"
 cat > "$apps/bloodborne-pc.desktop" <<DESK
 [Desktop Entry]
 Type=Application
 Name=Bloodborne
 Comment=Native PC port (smooth profile: 50 FPS, tuned for 4 GB GPUs)
-Exec=$bin/bloodborne smooth
+Exec=python3 $bin/bloodborne-app
 Icon=bloodborne-pc
 Categories=Game;
 Terminal=false
 StartupNotify=true
-StartupWMClass=bb-probe
-Actions=Quality;Battery;Fresh;Log;
+StartupWMClass=io.github.bbport.Bloodborne
+Actions=Play;Quality;Battery;Fresh;Log;
+
+[Desktop Action Play]
+Name=Play now (no window)
+Exec=$bin/bloodborne smooth
 
 [Desktop Action Quality]
 Name=Quality (sharper, 45 FPS)
